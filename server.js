@@ -26,18 +26,40 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Helper: Translate text to Arabic
+// Helper: Translate text to Arabic safely with web scraper fallback
 async function translateToArabic(text) {
+    if (!text) return null;
+    
+    // Primary: Google Translate API endpoint
     try {
         const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (data && data[0] && data[0][0] && data[0][0][0]) {
-            return data[0][0][0];
+        const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+        const contentType = res.headers.get('content-type') || '';
+
+        if (res.ok && contentType.includes('application/json')) {
+            const data = await res.json();
+            if (data && data[0] && data[0][0] && data[0][0][0]) {
+                return data[0][0][0];
+            }
         }
     } catch (e) {
-        console.error('Translation error:', e.message);
+        console.warn('Google Translate API error:', e.message);
     }
+
+    // Secondary: Web HTML fallback if API returns HTML/Block page
+    try {
+        const url2 = `https://translate.google.com/m?sl=auto&tl=ar&q=${encodeURIComponent(text)}`;
+        const res2 = await fetch(url2, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+        if (res2.ok) {
+            const html = await res2.text();
+            const $ = cheerio.load(html);
+            const translatedText = $('.result-container').text().trim();
+            if (translatedText) return translatedText;
+        }
+    } catch (e) {
+        console.warn('Google Translate HTML fallback error:', e.message);
+    }
+
     return null;
 }
 
