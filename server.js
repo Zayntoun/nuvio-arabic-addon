@@ -26,38 +26,46 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Helper: Translate text to Arabic safely with web scraper fallback
+// Helper: Translate text to Arabic via server-friendly MyMemory API + Fallbacks
 async function translateToArabic(text) {
     if (!text) return null;
     
-    // Primary: Google Translate API endpoint
+    // Method 1: MyMemory Translation API (Works reliably on cloud servers/Render)
     try {
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
+        const res = await fetch(url);
+        if (res.ok) {
+            const data = await res.json();
+            if (data && data.responseData && data.responseData.translatedText) {
+                const translation = data.responseData.translatedText.trim();
+                // Ensure the returned string actually contains Arabic characters
+                if (/[\u0600-\u06FF]/.test(translation)) {
+                    console.log(`[Translate Success] "${text}" -> "${translation}"`);
+                    return translation;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('[MyMemory Translate Error]:', e.message);
+    }
+
+    // Method 2: Google Translate GTX Endpoint
+    try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
         const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
         const contentType = res.headers.get('content-type') || '';
 
         if (res.ok && contentType.includes('application/json')) {
             const data = await res.json();
             if (data && data[0] && data[0][0] && data[0][0][0]) {
-                return data[0][0][0];
+                const translation = data[0][0][0];
+                if (/[\u0600-\u06FF]/.test(translation)) {
+                    return translation;
+                }
             }
         }
     } catch (e) {
-        console.warn('Google Translate API error:', e.message);
-    }
-
-    // Secondary: Web HTML fallback if API returns HTML/Block page
-    try {
-        const url2 = `https://translate.google.com/m?sl=auto&tl=ar&q=${encodeURIComponent(text)}`;
-        const res2 = await fetch(url2, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
-        if (res2.ok) {
-            const html = await res2.text();
-            const $ = cheerio.load(html);
-            const translatedText = $('.result-container').text().trim();
-            if (translatedText) return translatedText;
-        }
-    } catch (e) {
-        console.warn('Google Translate HTML fallback error:', e.message);
+        console.warn('[Google Translate Error]:', e.message);
     }
 
     return null;
@@ -79,12 +87,10 @@ async function resolveDirectAkwamUrl(linkUrl) {
         const res = await fetch(linkUrl, { headers: HEADERS, redirect: 'follow' });
         const finalUrl = res.url;
 
-        // If redirect points directly to an mp4 file
         if (finalUrl.includes('.mp4') || finalUrl.includes('.m3u8')) {
             return finalUrl;
         }
 
-        // If it loads an intermediate download page, extract final download button link
         const html = await res.text();
         const $ = cheerio.load(html);
         const directMp4 = $('a[href*=".mp4"], a.download-link, a[href*="dl."]').first().attr('href');
@@ -96,38 +102,63 @@ async function resolveDirectAkwamUrl(linkUrl) {
     }
 }
 
-// Fetch Title -> Safe JSON Parse -> Translate to Arabic -> Build Queue
+// Fetch Title -> Fallback Metadata Sources -> Translate to Arabic
 async function getMediaTitles(type, imdbId) {
     const titles = new Set();
-    
+    let baseTitle = null;
+
+    // 1. Try Cinemeta
     try {
-        // 1. Safe Cinemeta fetch
         const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`);
         const contentType = res.headers.get('content-type') || '';
 
         if (res.ok && contentType.includes('application/json')) {
             const data = await res.json();
             if (data && data.meta && data.meta.name) {
-                const baseTitle = data.meta.name;
-                const cleanedEnglish = cleanTitle(baseTitle);
-
-                // 2. Translate English title directly into Arabic
-                const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
-
-                if (arabicTranslation) {
-                    titles.add(arabicTranslation);
-                    const cleanedArabic = cleanTitle(arabicTranslation);
-                    if (cleanedArabic) titles.add(cleanedArabic);
-                }
-
-                if (cleanedEnglish) titles.add(cleanedEnglish);
-                titles.add(baseTitle);
+                baseTitle = data.meta.name;
             }
         } else {
-            console.warn(`[Cinemeta Warning] Returned status ${res.status} or non-JSON content`);
+            console.warn(`[Cinemeta Warning] Returned status ${res.status}`);
         }
     } catch (err) {
-        console.error('Title resolution error:', err.message);
+        console.error('[Cinemeta Error]:', err.message);
+    }
+
+    // 2. Fallback to IMDb HTML Scraper if Cinemeta 504s/fails
+    if (!baseTitle) {
+        try {
+            console.log(`[Metadata Fallback] Attempting direct IMDb lookup for ${imdbId}...`);
+            const imdbRes = await fetch(`https://www.imdb.com/title/${imdbId}/`, {
+                headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept-Language': 'en-US,en;q=0.9' }
+            });
+            if (imdbRes.ok) {
+                const html = await imdbRes.text();
+                const $ = cheerio.load(html);
+                const rawTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() || 
+                                 $('title').text().split('-')[0].trim();
+                if (rawTitle) {
+                    baseTitle = rawTitle;
+                    console.log(`[Metadata Success] Retrieved title from IMDb: "${baseTitle}"`);
+                }
+            }
+        } catch (err) {
+            console.error('[IMDb Fallback Error]:', err.message);
+        }
+    }
+
+    // Build search queue if a title was successfully resolved
+    if (baseTitle) {
+        const cleanedEnglish = cleanTitle(baseTitle);
+        const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+
+        if (arabicTranslation) {
+            titles.add(arabicTranslation);
+            const cleanedArabic = cleanTitle(arabicTranslation);
+            if (cleanedArabic) titles.add(cleanedArabic);
+        }
+
+        if (cleanedEnglish) titles.add(cleanedEnglish);
+        titles.add(baseTitle);
     }
 
     // Prioritize Arabic script strings first
@@ -169,7 +200,6 @@ async function scrapeAkwam(queryTitle) {
                 if (link) downloadLinks.push({ link, label });
             });
 
-            // Resolve raw video stream links for Nuvio internal player
             for (const item of downloadLinks.slice(0, 2)) {
                 console.log(`[Resolving Stream] ${item.link}`);
                 const directUrl = await resolveDirectAkwamUrl(item.link);
