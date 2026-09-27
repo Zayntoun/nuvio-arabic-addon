@@ -74,28 +74,41 @@ async function resolveDirectAkwamUrl(linkUrl) {
     }
 }
 
+// Fetch Title -> Safe JSON Parse -> Translate to Arabic -> Build Queue
 async function getMediaTitles(type, imdbId) {
     const titles = new Set();
+    
     try {
+        // 1. Safe Cinemeta fetch
         const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`);
-        const data = await res.json();
-        if (data.meta && data.meta.name) {
-            const baseTitle = data.meta.name;
-            const cleanedEnglish = cleanTitle(baseTitle);
-            const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+        const contentType = res.headers.get('content-type') || '';
 
-            if (arabicTranslation) {
-                titles.add(arabicTranslation);
-                const cleanedArabic = cleanTitle(arabicTranslation);
-                if (cleanedArabic) titles.add(cleanedArabic);
+        if (res.ok && contentType.includes('application/json')) {
+            const data = await res.json();
+            if (data && data.meta && data.meta.name) {
+                const baseTitle = data.meta.name;
+                const cleanedEnglish = cleanTitle(baseTitle);
+
+                // 2. Translate English title directly into Arabic
+                const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+
+                if (arabicTranslation) {
+                    titles.add(arabicTranslation);
+                    const cleanedArabic = cleanTitle(arabicTranslation);
+                    if (cleanedArabic) titles.add(cleanedArabic);
+                }
+
+                if (cleanedEnglish) titles.add(cleanedEnglish);
+                titles.add(baseTitle);
             }
-            if (cleanedEnglish) titles.add(cleanedEnglish);
-            titles.add(baseTitle);
+        } else {
+            console.warn(`[Cinemeta Warning] Returned status ${res.status} or non-JSON content`);
         }
     } catch (err) {
         console.error('Title resolution error:', err.message);
     }
 
+    // Prioritize Arabic script strings first
     const titleList = Array.from(titles).filter(Boolean);
     titleList.sort((a, b) => {
         const aHasArabic = /[\u0600-\u06FF]/.test(a);
