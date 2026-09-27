@@ -30,7 +30,7 @@ app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 async function translateToArabic(text) {
     if (!text) return null;
     
-    // 1. Try MyMemory API
+    // 1. MyMemory API
     try {
         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
         const res = await fetch(url);
@@ -48,7 +48,7 @@ async function translateToArabic(text) {
         console.warn('[MyMemory Translate Error]:', e.message);
     }
 
-    // 2. Try Google Translate Client Endpoint
+    // 2. Google Translate Client Endpoint
     try {
         const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
         const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
@@ -101,89 +101,94 @@ async function resolveDirectAkwamUrl(linkUrl) {
     }
 }
 
-// Fetch Title -> Strips Series Ep Params -> TMDB / Cinemeta / Arabic IMDb Scraper
+// Fetch Title -> Bulletproof Multi-Source Fallback Chain
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     let baseTitle = null;
 
-    // Strip season/episode params (e.g. tt40261004:1:1 -> tt40261004)
+    // Clean season and episode numbers from series IDs (tt40261004:1:1 -> tt40261004)
     const cleanImdbId = rawId.split(':')[0];
 
-    // 1. Try TMDB Find API in Arabic
+    // Method 1: Cinemeta Official Stremio API (Primary for Stremio/Nuvio)
     try {
-        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
-        const tmdbRes = await fetch(tmdbUrl);
-        if (tmdbRes.ok) {
-            const data = await tmdbRes.json();
-            const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
-            if (result) {
-                if (result.title || result.name) {
-                    const tmdbTitle = result.title || result.name;
-                    if (/[\u0600-\u06FF]/.test(tmdbTitle)) {
-                        titles.add(tmdbTitle);
-                        console.log(`[TMDB AR Success] "${tmdbTitle}"`);
-                    }
-                }
-                if (result.original_title || result.original_name) {
-                    baseTitle = result.original_title || result.original_name;
-                }
-            }
-        }
-    } catch (err) {
-        console.warn('[TMDB Error]:', err.message);
-    }
-
-    // 2. Fetch Native Arabic Title Directly from IMDb Page (Accept-Language: ar-EG)
-    try {
-        console.log(`[IMDb Arabic Lookup] Fetching localized title for ${cleanImdbId}...`);
-        const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
-            headers: { 
-                'User-Agent': HEADERS['User-Agent'], 
-                'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8' 
-            }
-        });
-        if (imdbRes.ok) {
-            const html = await imdbRes.text();
-            const $ = cheerio.load(html);
-            const arabicTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() ||
-                                $('title').text().split('-')[0].split('(')[0].trim();
-
-            if (arabicTitle && /[\u0600-\u06FF]/.test(arabicTitle)) {
-                titles.add(arabicTitle);
-                const cleanedArabic = cleanTitle(arabicTitle);
-                if (cleanedArabic) titles.add(cleanedArabic);
-                console.log(`[IMDb Arabic Match]: "${arabicTitle}"`);
-            } else if (arabicTitle && !baseTitle) {
-                baseTitle = arabicTitle;
-            }
-        }
-    } catch (err) {
-        console.warn('[IMDb Arabic Lookup Error]:', err.message);
-    }
-
-    // 3. Fallback to Cinemeta if we still don't have an English base title
-    if (!baseTitle) {
-        try {
-            const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`);
+        const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
+        const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+        if (res.ok) {
             const contentType = res.headers.get('content-type') || '';
-
-            if (res.ok && contentType.includes('application/json')) {
+            if (contentType.includes('application/json')) {
                 const data = await res.json();
                 if (data && data.meta && data.meta.name) {
                     baseTitle = data.meta.name;
+                    console.log(`[Cinemeta Success] Title: "${baseTitle}"`);
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[Cinemeta Error]:', err.message);
+    }
+
+    // Method 2: TMDB Find API
+    if (!baseTitle) {
+        try {
+            const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
+            const tmdbRes = await fetch(tmdbUrl);
+            if (tmdbRes.ok) {
+                const data = await tmdbRes.json();
+                const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
+                if (result) {
+                    if (result.title || result.name) {
+                        const tmdbTitle = result.title || result.name;
+                        if (/[\u0600-\u06FF]/.test(tmdbTitle)) {
+                            titles.add(tmdbTitle);
+                            console.log(`[TMDB AR Success] "${tmdbTitle}"`);
+                        }
+                    }
+                    if (result.original_title || result.original_name) {
+                        baseTitle = result.original_title || result.original_name;
+                    }
                 }
             }
         } catch (err) {
-            console.warn('[Cinemeta Error]:', err.message);
+            console.warn('[TMDB Error]:', err.message);
         }
     }
 
-    // 4. If we have an English title but no Arabic title yet, run translation
+    // Method 3: IMDb HTML Scraper
+    if (!baseTitle) {
+        try {
+            console.log(`[IMDb Lookup] Fetching title for ${cleanImdbId}...`);
+            const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
+                headers: { 
+                    'User-Agent': HEADERS['User-Agent'],
+                    'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8'
+                }
+            });
+            if (imdbRes.ok) {
+                const html = await imdbRes.text();
+                const $ = cheerio.load(html);
+                const scrapedTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() ||
+                                     $('title').text().split('-')[0].split('(')[0].trim();
+
+                if (scrapedTitle) {
+                    if (/[\u0600-\u06FF]/.test(scrapedTitle)) {
+                        titles.add(scrapedTitle);
+                    }
+                    baseTitle = scrapedTitle;
+                    console.log(`[IMDb Success] Title: "${baseTitle}"`);
+                }
+            }
+        } catch (err) {
+            console.warn('[IMDb Error]:', err.message);
+        }
+    }
+
+    // Process base title if retrieved
     if (baseTitle) {
         const cleanedEnglish = cleanTitle(baseTitle);
         if (cleanedEnglish) titles.add(cleanedEnglish);
         titles.add(baseTitle);
 
+        // Translate to Arabic if no Arabic script present in Set
         const hasArabicScript = Array.from(titles).some(t => /[\u0600-\u06FF]/.test(t));
         if (!hasArabicScript) {
             const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
@@ -195,7 +200,7 @@ async function getMediaTitles(type, rawId) {
         }
     }
 
-    // Prioritize Arabic script strings first in search queue
+    // Sort queue: Arabic script titles first
     const titleList = Array.from(titles).filter(Boolean);
     titleList.sort((a, b) => {
         const aHasArabic = /[\u0600-\u06FF]/.test(a);
