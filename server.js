@@ -26,11 +26,10 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Helper: Translate text to Arabic via server-friendly MyMemory API + Fallbacks
+// Helper: Translate text to Arabic via MyMemory API + Google Fallback
 async function translateToArabic(text) {
     if (!text) return null;
     
-    // Method 1: MyMemory Translation API (Works reliably on cloud servers/Render)
     try {
         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
         const res = await fetch(url);
@@ -38,7 +37,6 @@ async function translateToArabic(text) {
             const data = await res.json();
             if (data && data.responseData && data.responseData.translatedText) {
                 const translation = data.responseData.translatedText.trim();
-                // Ensure the returned string actually contains Arabic characters
                 if (/[\u0600-\u06FF]/.test(translation)) {
                     console.log(`[Translate Success] "${text}" -> "${translation}"`);
                     return translation;
@@ -49,7 +47,6 @@ async function translateToArabic(text) {
         console.warn('[MyMemory Translate Error]:', e.message);
     }
 
-    // Method 2: Google Translate GTX Endpoint
     try {
         const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
         const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
@@ -102,66 +99,91 @@ async function resolveDirectAkwamUrl(linkUrl) {
     }
 }
 
-// Fetch Title -> Fallback Metadata Sources -> Translate to Arabic
-async function getMediaTitles(type, imdbId) {
+// Fetch Title -> Strips Series Ep Params -> TMDB / Cinemeta / IMDb -> Arabic Resolution
+async function getMediaTitles(type, rawId) {
     const titles = new Set();
     let baseTitle = null;
 
-    // 1. Try Cinemeta
-    try {
-        const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`);
-        const contentType = res.headers.get('content-type') || '';
+    // Strip season and episode numbers from series IDs (e.g., tt40261004:1:1 -> tt40261004)
+    const cleanImdbId = rawId.split(':')[0];
 
-        if (res.ok && contentType.includes('application/json')) {
-            const data = await res.json();
-            if (data && data.meta && data.meta.name) {
-                baseTitle = data.meta.name;
+    // 1. Try TMDB Find API
+    try {
+        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar`;
+        const tmdbRes = await fetch(tmdbUrl);
+        if (tmdbRes.ok) {
+            const data = await tmdbRes.json();
+            const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
+            if (result) {
+                if (result.title || result.name) {
+                    const tmdbTitle = result.title || result.name;
+                    titles.add(tmdbTitle);
+                    console.log(`[TMDB AR Success] Resolved Arabic Title: "${tmdbTitle}"`);
+                }
+                if (result.original_title || result.original_name) {
+                    baseTitle = result.original_title || result.original_name;
+                }
             }
-        } else {
-            console.warn(`[Cinemeta Warning] Returned status ${res.status}`);
         }
     } catch (err) {
-        console.error('[Cinemeta Error]:', err.message);
+        console.warn('[TMDB Error]:', err.message);
     }
 
-    // 2. Fallback to IMDb HTML Scraper if Cinemeta 504s/fails
+    // 2. Fallback to Cinemeta
     if (!baseTitle) {
         try {
-            console.log(`[Metadata Fallback] Attempting direct IMDb lookup for ${imdbId}...`);
-            const imdbRes = await fetch(`https://www.imdb.com/title/${imdbId}/`, {
+            const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`);
+            const contentType = res.headers.get('content-type') || '';
+
+            if (res.ok && contentType.includes('application/json')) {
+                const data = await res.json();
+                if (data && data.meta && data.meta.name) {
+                    baseTitle = data.meta.name;
+                }
+            }
+        } catch (err) {
+            console.warn('[Cinemeta Error]:', err.message);
+        }
+    }
+
+    // 3. Fallback to IMDb HTML Scraper
+    if (!baseTitle && titles.size === 0) {
+        try {
+            console.log(`[IMDb Lookup] Fetching title for ${cleanImdbId}...`);
+            const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
                 headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept-Language': 'en-US,en;q=0.9' }
             });
             if (imdbRes.ok) {
                 const html = await imdbRes.text();
                 const $ = cheerio.load(html);
                 const rawTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() || 
-                                 $('title').text().split('-')[0].trim();
+                                 $('title').text().split('-')[0].split('(')[0].trim();
                 if (rawTitle) {
                     baseTitle = rawTitle;
-                    console.log(`[Metadata Success] Retrieved title from IMDb: "${baseTitle}"`);
                 }
             }
         } catch (err) {
-            console.error('[IMDb Fallback Error]:', err.message);
+            console.warn('[IMDb Error]:', err.message);
         }
     }
 
-    // Build search queue if a title was successfully resolved
+    // Process title translation if needed
     if (baseTitle) {
         const cleanedEnglish = cleanTitle(baseTitle);
-        const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+        titles.add(cleanedEnglish || baseTitle);
 
-        if (arabicTranslation) {
-            titles.add(arabicTranslation);
-            const cleanedArabic = cleanTitle(arabicTranslation);
-            if (cleanedArabic) titles.add(cleanedArabic);
+        const hasArabicScript = Array.from(titles).some(t => /[\u0600-\u06FF]/.test(t));
+        
+        if (!hasArabicScript) {
+            const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+            if (arabicTranslation) {
+                titles.add(arabicTranslation);
+                const cleanedArabic = cleanTitle(arabicTranslation);
+                if (cleanedArabic) titles.add(cleanedArabic);
+            }
         }
-
-        if (cleanedEnglish) titles.add(cleanedEnglish);
-        titles.add(baseTitle);
     }
 
-    // Prioritize Arabic script strings first
     const titleList = Array.from(titles).filter(Boolean);
     titleList.sort((a, b) => {
         const aHasArabic = /[\u0600-\u06FF]/.test(a);
@@ -171,6 +193,7 @@ async function getMediaTitles(type, imdbId) {
         return 0;
     });
 
+    console.log(`[Final Search Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
 }
 
