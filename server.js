@@ -26,10 +26,11 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Helper: Translate text to Arabic via MyMemory API + Google Fallback
+// Helper: Translate text to Arabic with multiple fallback endpoints
 async function translateToArabic(text) {
     if (!text) return null;
     
+    // 1. Try MyMemory API
     try {
         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
         const res = await fetch(url);
@@ -47,6 +48,7 @@ async function translateToArabic(text) {
         console.warn('[MyMemory Translate Error]:', e.message);
     }
 
+    // 2. Try Google Translate Client Endpoint
     try {
         const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
         const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
@@ -99,17 +101,17 @@ async function resolveDirectAkwamUrl(linkUrl) {
     }
 }
 
-// Fetch Title -> Strips Series Ep Params -> TMDB / Cinemeta / IMDb -> Arabic Resolution
+// Fetch Title -> Strips Series Ep Params -> TMDB / Cinemeta / Arabic IMDb Scraper
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     let baseTitle = null;
 
-    // Strip season and episode numbers from series IDs (e.g., tt40261004:1:1 -> tt40261004)
+    // Strip season/episode params (e.g. tt40261004:1:1 -> tt40261004)
     const cleanImdbId = rawId.split(':')[0];
 
-    // 1. Try TMDB Find API
+    // 1. Try TMDB Find API in Arabic
     try {
-        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar`;
+        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
         const tmdbRes = await fetch(tmdbUrl);
         if (tmdbRes.ok) {
             const data = await tmdbRes.json();
@@ -117,8 +119,10 @@ async function getMediaTitles(type, rawId) {
             if (result) {
                 if (result.title || result.name) {
                     const tmdbTitle = result.title || result.name;
-                    titles.add(tmdbTitle);
-                    console.log(`[TMDB AR Success] Resolved Arabic Title: "${tmdbTitle}"`);
+                    if (/[\u0600-\u06FF]/.test(tmdbTitle)) {
+                        titles.add(tmdbTitle);
+                        console.log(`[TMDB AR Success] "${tmdbTitle}"`);
+                    }
                 }
                 if (result.original_title || result.original_name) {
                     baseTitle = result.original_title || result.original_name;
@@ -129,7 +133,35 @@ async function getMediaTitles(type, rawId) {
         console.warn('[TMDB Error]:', err.message);
     }
 
-    // 2. Fallback to Cinemeta
+    // 2. Fetch Native Arabic Title Directly from IMDb Page (Accept-Language: ar-EG)
+    try {
+        console.log(`[IMDb Arabic Lookup] Fetching localized title for ${cleanImdbId}...`);
+        const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
+            headers: { 
+                'User-Agent': HEADERS['User-Agent'], 
+                'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8' 
+            }
+        });
+        if (imdbRes.ok) {
+            const html = await imdbRes.text();
+            const $ = cheerio.load(html);
+            const arabicTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() ||
+                                $('title').text().split('-')[0].split('(')[0].trim();
+
+            if (arabicTitle && /[\u0600-\u06FF]/.test(arabicTitle)) {
+                titles.add(arabicTitle);
+                const cleanedArabic = cleanTitle(arabicTitle);
+                if (cleanedArabic) titles.add(cleanedArabic);
+                console.log(`[IMDb Arabic Match]: "${arabicTitle}"`);
+            } else if (arabicTitle && !baseTitle) {
+                baseTitle = arabicTitle;
+            }
+        }
+    } catch (err) {
+        console.warn('[IMDb Arabic Lookup Error]:', err.message);
+    }
+
+    // 3. Fallback to Cinemeta if we still don't have an English base title
     if (!baseTitle) {
         try {
             const res = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`);
@@ -146,34 +178,13 @@ async function getMediaTitles(type, rawId) {
         }
     }
 
-    // 3. Fallback to IMDb HTML Scraper
-    if (!baseTitle && titles.size === 0) {
-        try {
-            console.log(`[IMDb Lookup] Fetching title for ${cleanImdbId}...`);
-            const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
-                headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept-Language': 'en-US,en;q=0.9' }
-            });
-            if (imdbRes.ok) {
-                const html = await imdbRes.text();
-                const $ = cheerio.load(html);
-                const rawTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() || 
-                                 $('title').text().split('-')[0].split('(')[0].trim();
-                if (rawTitle) {
-                    baseTitle = rawTitle;
-                }
-            }
-        } catch (err) {
-            console.warn('[IMDb Error]:', err.message);
-        }
-    }
-
-    // Process title translation if needed
+    // 4. If we have an English title but no Arabic title yet, run translation
     if (baseTitle) {
         const cleanedEnglish = cleanTitle(baseTitle);
-        titles.add(cleanedEnglish || baseTitle);
+        if (cleanedEnglish) titles.add(cleanedEnglish);
+        titles.add(baseTitle);
 
         const hasArabicScript = Array.from(titles).some(t => /[\u0600-\u06FF]/.test(t));
-        
         if (!hasArabicScript) {
             const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
             if (arabicTranslation) {
@@ -184,6 +195,7 @@ async function getMediaTitles(type, rawId) {
         }
     }
 
+    // Prioritize Arabic script strings first in search queue
     const titleList = Array.from(titles).filter(Boolean);
     titleList.sort((a, b) => {
         const aHasArabic = /[\u0600-\u06FF]/.test(a);
