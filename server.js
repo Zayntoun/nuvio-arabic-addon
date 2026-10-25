@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.7.0',
+    version: '1.8.0',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Fully dynamic Arabic media resolver using native TMDB Arabic metadata',
+    description: 'Dynamic Arabic media resolver powered by Aradeb catalog bridge',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -26,7 +26,24 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Resolve Akwam Watch page video source
+// Helper: Translate fallback text to Arabic
+async function translateToArabic(text) {
+    if (!text) return null;
+    try {
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
+        const res = await fetch(url);
+        if (res.ok) {
+            const data = await res.json();
+            if (data && data.responseData && data.responseData.translatedText) {
+                const translation = data.responseData.translatedText.trim();
+                if (/[\u0600-\u06FF]/.test(translation)) return translation;
+            }
+        }
+    } catch (e) {}
+    return null;
+}
+
+// Resolve Akwam Watch page video stream link
 async function resolveAkwamWatchPage(watchUrl) {
     try {
         const res = await fetch(watchUrl, { headers: HEADERS, redirect: 'follow' });
@@ -51,41 +68,51 @@ async function resolveAkwamWatchPage(watchUrl) {
     }
 }
 
-// 100% Dynamic Metadata Fetcher using TMDB Native Arabic Lookup
+// ARADEB & TMDB Hybrid Metadata Resolver
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     const cleanImdbId = rawId.split(':')[0];
-    const tmdbMediaType = type === 'series' ? 'tv' : 'movie';
 
+    // Method 1: Query Aradeb's metadata endpoint directly for the native Arabic catalog name
     try {
-        // Query TMDB directly with language set to Arabic (ar-EG) using IMDb ID
-        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
-        console.log(`[TMDB Lookup] Fetching Arabic metadata for ${cleanImdbId}`);
-        
-        const res = await fetch(tmdbUrl);
-        if (res.ok) {
-            const data = await res.json();
-            const results = type === 'series' ? data.tv_results : data.movie_results;
-            
-            if (results && results.length > 0) {
-                const item = results[0];
-                const arabicTitle = item.title || item.name;
-                const originalTitle = item.original_title || item.original_name;
-
-                if (arabicTitle && /[\u0600-\u06FF]/.test(arabicTitle)) {
-                    titles.add(arabicTitle);
-                    console.log(`[TMDB Native Arabic Title Found]: ${arabicTitle}`);
-                }
-                if (originalTitle) {
-                    titles.add(originalTitle);
+        const aradebMetaUrl = `https://aradeb.518878.xyz/meta/${type}/${cleanImdbId}.json`;
+        console.log(`[Aradeb Bridge] Fetching Arabic catalog metadata for ${cleanImdbId}`);
+        const aradebRes = await fetch(aradebMetaUrl, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+        if (aradebRes.ok) {
+            const data = await aradebRes.json();
+            if (data && data.meta && data.meta.name) {
+                const arName = data.meta.name;
+                if (/[\u0600-\u06FF]/.test(arName)) {
+                    titles.add(arName);
+                    console.log(`[Aradeb Native Arabic Title Found]: "${arName}"`);
                 }
             }
         }
-    } catch (e) {
-        console.warn('[TMDB Lookup Error]:', e.message);
+    } catch (err) {
+        console.warn('[Aradeb Bridge Error]:', err.message);
     }
 
-    // Fallback to Cinemeta if TMDB didn't yield an Arabic result
+    // Method 2: TMDB Arabic Find Fallback
+    if (titles.size === 0) {
+        try {
+            const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
+            const tmdbRes = await fetch(tmdbUrl);
+            if (tmdbRes.ok) {
+                const data = await tmdbRes.json();
+                const results = type === 'series' ? data.tv_results : data.movie_results;
+                if (results && results.length > 0) {
+                    const item = results[0];
+                    const arabicTitle = item.title || item.name;
+                    if (arabicTitle && /[\u0600-\u06FF]/.test(arabicTitle)) {
+                        titles.add(arabicTitle);
+                        console.log(`[TMDB Native Arabic Title Found]: "${arabicTitle}"`);
+                    }
+                }
+            }
+        } catch (err) {}
+    }
+
+    // Method 3: Cinemeta Title + Forced Translation Fallback
     if (titles.size === 0) {
         try {
             const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
@@ -93,14 +120,16 @@ async function getMediaTitles(type, rawId) {
             if (res.ok) {
                 const data = await res.json();
                 if (data && data.meta && data.meta.name) {
-                    titles.add(data.meta.name);
+                    const engTitle = data.meta.name;
+                    const arTrans = await translateToArabic(engTitle);
+                    if (arTrans) titles.add(arTrans);
+                    titles.add(engTitle);
                 }
             }
         } catch (err) {}
     }
 
     const titleList = Array.from(titles).filter(Boolean);
-    // Prioritize Arabic script strictly
     titleList.sort((a, b) => (/[\u0600-\u06FF]/.test(a) ? -1 : 1));
     console.log(`[Dynamic Search Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
@@ -182,96 +211,3 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
         console.error('[Akwam Error]:', e.message);
     }
     return streams;
-}
-
-// EgyBest Scraper
-async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
-    const streams = [];
-    const EGYBEST_DOMAIN = 'https://egybesstt.bond';
-    
-    try {
-        const searchUrl = `${EGYBEST_DOMAIN}/search.php?keywords=${encodeURIComponent(queryTitle)}&video-id=`;
-        console.log(`[EgyBest Search] "${queryTitle}"`);
-        const res = await fetch(searchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-        if (!res.ok) return streams;
-
-        const $ = cheerio.load(await res.text());
-        let watchPath = null;
-
-        $('a').each((i, el) => {
-            const href = $(el).attr('href') || '';
-            const text = $(el).text().trim();
-
-            if (href.includes('watch.php?vid=')) {
-                if (targetEpisode) {
-                    if (text.includes(`حلقة ${targetEpisode}`) || text.includes(`${targetEpisode}`)) {
-                        watchPath = href;
-                        return false;
-                    }
-                } else if (!watchPath) {
-                    watchPath = href;
-                }
-            }
-        });
-
-        if (watchPath) {
-            const fullWatchUrl = watchPath.startsWith('http') ? watchPath : `${EGYBEST_DOMAIN}/${watchPath}`;
-            const watchRes = await fetch(fullWatchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-            const $watch = cheerio.load(await watchRes.text());
-
-            const iframeSrc = $watch('iframe.embed_player, iframe[src*="embed"], iframe[src*="play"]').attr('src');
-            if (iframeSrc) {
-                const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
-                streams.push({
-                    name: 'EgyBest (إيجيبست)',
-                    title: `HD | Native Stream`,
-                    url: streamUrl,
-                    behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': `${EGYBEST_DOMAIN}/` } } }
-                });
-            }
-        }
-    } catch (e) {
-        console.error('[EgyBest Error]:', e.message);
-    }
-    return streams;
-}
-
-app.get('/stream/:type/:id.json', async (req, res) => {
-    const { type, id } = req.params;
-    const cleanId = id.replace('.json', '');
-
-    console.log(`\n========================================`);
-    console.log(`[REQUEST] ${type} ID: ${cleanId}`);
-
-    let episode = 1;
-    const parts = cleanId.split(':');
-    if (type === 'series' && parts.length >= 3) {
-        episode = parts[2];
-    }
-
-    const baseTitles = await getMediaTitles(type, cleanId);
-    if (baseTitles.length === 0) return res.json({ streams: [] });
-
-    let allStreams = [];
-
-    for (const title of baseTitles) {
-        const [akwamResults, egybestResults] = await Promise.all([
-            scrapeAkwam(title, episode, type),
-            scrapeEgyBest(title, episode, type)
-        ]);
-        
-        allStreams = [...allStreams, ...akwamResults, ...egybestResults];
-        if (allStreams.length > 0) {
-            console.log(`✓ Streams found using query: "${title}"`);
-            break;
-        }
-    }
-
-    console.log(`Total streams delivered: ${allStreams.length}`);
-    console.log(`========================================\n`);
-    res.json({ streams: allStreams });
-});
-
-app.listen(PORT, () => {
-    console.log(`\n🚀 Fully Dynamic Arabic Resolver active on http://127.0.0.1:${PORT}`);
-});
