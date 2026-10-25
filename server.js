@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.8.0',
+    version: '2.0.0',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Dynamic Arabic media resolver powered by Aradeb catalog bridge',
+    description: 'Dynamic Arabic resolver powered by ArabCity Metadata Bridge',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -26,7 +26,7 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Helper: Translate fallback text to Arabic
+// Helper: Translate text to Arabic as last-resort fallback
 async function translateToArabic(text) {
     if (!text) return null;
     try {
@@ -68,28 +68,28 @@ async function resolveAkwamWatchPage(watchUrl) {
     }
 }
 
-// ARADEB & TMDB Hybrid Metadata Resolver
+// ARABCITY Metadata Bridge Resolver
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     const cleanImdbId = rawId.split(':')[0];
 
-    // Method 1: Query Aradeb's metadata endpoint directly for the native Arabic catalog name
+    // Method 1: Query ArabCity Metadata API directly
     try {
-        const aradebMetaUrl = `https://aradeb.518878.xyz/meta/${type}/${cleanImdbId}.json`;
-        console.log(`[Aradeb Bridge] Fetching Arabic catalog metadata for ${cleanImdbId}`);
-        const aradebRes = await fetch(aradebMetaUrl, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
-        if (aradebRes.ok) {
-            const data = await aradebRes.json();
+        const arabCityUrl = `https://arabcity.fly.dev/YWxs/meta/${type}/${cleanImdbId}.json`;
+        console.log(`[ArabCity Bridge] Fetching Arabic catalog metadata for ${cleanImdbId}`);
+        const arabRes = await fetch(arabCityUrl, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+        if (arabRes.ok) {
+            const data = await arabRes.json();
             if (data && data.meta && data.meta.name) {
                 const arName = data.meta.name;
                 if (/[\u0600-\u06FF]/.test(arName)) {
                     titles.add(arName);
-                    console.log(`[Aradeb Native Arabic Title Found]: "${arName}"`);
+                    console.log(`[ArabCity Native Arabic Title Found]: "${arName}"`);
                 }
             }
         }
     } catch (err) {
-        console.warn('[Aradeb Bridge Error]:', err.message);
+        console.warn('[ArabCity Bridge Error]:', err.message);
     }
 
     // Method 2: TMDB Arabic Find Fallback
@@ -211,3 +211,96 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
         console.error('[Akwam Error]:', e.message);
     }
     return streams;
+}
+
+// EgyBest Scraper
+async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
+    const streams = [];
+    const EGYBEST_DOMAIN = 'https://egybesstt.bond';
+    
+    try {
+        const searchUrl = `${EGYBEST_DOMAIN}/search.php?keywords=${encodeURIComponent(queryTitle)}&video-id=`;
+        console.log(`[EgyBest Search] "${queryTitle}"`);
+        const res = await fetch(searchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
+        if (!res.ok) return streams;
+
+        const $ = cheerio.load(await res.text());
+        let watchPath = null;
+
+        $('a').each((i, el) => {
+            const href = $(el).attr('href') || '';
+            const text = $(el).text().trim();
+
+            if (href.includes('watch.php?vid=')) {
+                if (targetEpisode) {
+                    if (text.includes(`حلقة ${targetEpisode}`) || text.includes(`${targetEpisode}`)) {
+                        watchPath = href;
+                        return false;
+                    }
+                } else if (!watchPath) {
+                    watchPath = href;
+                }
+            }
+        });
+
+        if (watchPath) {
+            const fullWatchUrl = watchPath.startsWith('http') ? watchPath : `${EGYBEST_DOMAIN}/${watchPath}`;
+            const watchRes = await fetch(fullWatchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
+            const $watch = cheerio.load(await watchRes.text());
+
+            const iframeSrc = $watch('iframe.embed_player, iframe[src*="embed"], iframe[src*="play"]').attr('src');
+            if (iframeSrc) {
+                const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
+                streams.push({
+                    name: 'EgyBest (إيجيبست)',
+                    title: `HD | Native Stream`,
+                    url: streamUrl,
+                    behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': `${EGYBEST_DOMAIN}/` } } }
+                });
+            }
+        }
+    } catch (e) {
+        console.error('[EgyBest Error]:', e.message);
+    }
+    return streams;
+}
+
+app.get('/stream/:type/:id.json', async (req, res) => {
+    const { type, id } = req.params;
+    const cleanId = id.replace('.json', '');
+
+    console.log(`\n========================================`);
+    console.log(`[REQUEST] ${type} ID: ${cleanId}`);
+
+    let episode = 1;
+    const parts = cleanId.split(':');
+    if (type === 'series' && parts.length >= 3) {
+        episode = parts[2];
+    }
+
+    const baseTitles = await getMediaTitles(type, cleanId);
+    if (baseTitles.length === 0) return res.json({ streams: [] });
+
+    let allStreams = [];
+
+    for (const title of baseTitles) {
+        const [akwamResults, egybestResults] = await Promise.all([
+            scrapeAkwam(title, episode, type),
+            scrapeEgyBest(title, episode, type)
+        ]);
+        
+        allStreams = [...allStreams, ...akwamResults, ...egybestResults];
+        if (allStreams.length > 0) {
+            console.log(`✓ Streams found using query: "${title}"`);
+            break;
+        }
+    }
+
+    console.log(`Total streams delivered: ${allStreams.length}`);
+    console.log(`========================================\n`);
+    res.json({ streams: allStreams });
+});
+
+app.listen(PORT, () => {
+    console.log(`\n🚀 ArabCity-Powered Arabic Resolver active on http://127.0.0.1:${PORT}`);
+});
