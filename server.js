@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.1.0',
+    version: '1.1.1',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver for Nuvio internal player with updated EgyBest domain',
+    description: 'Direct stream resolver with deep episode matching',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -29,7 +29,6 @@ app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 // Helper: Translate text to Arabic
 async function translateToArabic(text) {
     if (!text) return null;
-    
     try {
         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
         const res = await fetch(url);
@@ -38,7 +37,6 @@ async function translateToArabic(text) {
             if (data && data.responseData && data.responseData.translatedText) {
                 const translation = data.responseData.translatedText.trim();
                 if (/[\u0600-\u06FF]/.test(translation)) {
-                    console.log(`[Translate Success] "${text}" -> "${translation}"`);
                     return translation;
                 }
             }
@@ -46,25 +44,6 @@ async function translateToArabic(text) {
     } catch (e) {
         console.warn('[MyMemory Translate Error]:', e.message);
     }
-
-    try {
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
-        const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
-        const contentType = res.headers.get('content-type') || '';
-
-        if (res.ok && contentType.includes('application/json')) {
-            const data = await res.json();
-            if (data && data[0] && data[0][0] && data[0][0][0]) {
-                const translation = data[0][0][0];
-                if (/[\u0600-\u06FF]/.test(translation)) {
-                    return translation;
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('[Google Translate Error]:', e.message);
-    }
-
     return null;
 }
 
@@ -116,7 +95,6 @@ async function getMediaTitles(type, rawId) {
                 const data = await res.json();
                 if (data && data.meta && data.meta.name) {
                     baseTitle = data.meta.name;
-                    console.log(`[Cinemeta Success] Title: "${baseTitle}"`);
                 }
             }
         }
@@ -137,7 +115,6 @@ async function getMediaTitles(type, rawId) {
                         const tmdbTitle = result.title || result.name;
                         if (/[\u0600-\u06FF]/.test(tmdbTitle)) {
                             titles.add(tmdbTitle);
-                            console.log(`[TMDB AR Success] "${tmdbTitle}"`);
                         }
                     }
                     if (result.original_title || result.original_name) {
@@ -147,35 +124,6 @@ async function getMediaTitles(type, rawId) {
             }
         } catch (err) {
             console.warn('[TMDB Error]:', err.message);
-        }
-    }
-
-    // Method 3: IMDb HTML Scraper
-    if (!baseTitle) {
-        try {
-            console.log(`[IMDb Lookup] Fetching title for ${cleanImdbId}...`);
-            const imdbRes = await fetch(`https://www.imdb.com/title/${cleanImdbId}/`, {
-                headers: { 
-                    'User-Agent': HEADERS['User-Agent'],
-                    'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8'
-                }
-            });
-            if (imdbRes.ok) {
-                const html = await imdbRes.text();
-                const $ = cheerio.load(html);
-                const scrapedTitle = $('h1[data-testid="hero__pageTitle"] span').first().text().trim() ||
-                                     $('title').text().split('-')[0].split('(')[0].trim();
-
-                if (scrapedTitle) {
-                    if (/[\u0600-\u06FF]/.test(scrapedTitle)) {
-                        titles.add(scrapedTitle);
-                    }
-                    baseTitle = scrapedTitle;
-                    console.log(`[IMDb Success] Title: "${baseTitle}"`);
-                }
-            }
-        } catch (err) {
-            console.warn('[IMDb Error]:', err.message);
         }
     }
 
@@ -204,12 +152,11 @@ async function getMediaTitles(type, rawId) {
         return 0;
     });
 
-    console.log(`[Final Search Base Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
 }
 
-// Scrape and Resolve Akwam Streams
-async function scrapeAkwam(queryTitle) {
+// Scrape and Resolve Akwam Streams with Deep Episode Navigation
+async function scrapeAkwam(queryTitle, targetEpisode) {
     const streams = [];
     try {
         const searchUrl = `https://akwam.ss/search?q=${encodeURIComponent(queryTitle)}`;
@@ -219,158 +166,18 @@ async function scrapeAkwam(queryTitle) {
         const html = await res.text();
         const $ = cheerio.load(html);
 
-        const entryUrl = $('a[href*="/movie/"], a[href*="/series/"], a[href*="/episode/"], .entry-box a').first().attr('href');
+        let entryUrl = null;
 
-        if (entryUrl) {
-            console.log(`[Akwam Match] Page found: ${entryUrl}`);
-            const entryRes = await fetch(entryUrl, { headers: HEADERS });
-            const entryHtml = await entryRes.text();
-            const $entry = cheerio.load(entryHtml);
-
-            const downloadLinks = [];
-            $entry('a[href*="/download/"], a.link-download, a.btn-primary').each((i, el) => {
-                const link = $entry(el).attr('href');
-                const label = $entry(el).text().trim() || 'Akwam Direct Stream';
-                if (link) downloadLinks.push({ link, label });
+        // If looking for a specific episode, look for direct episode link match first
+        if (targetEpisode) {
+            $('a[href*="/episode/"]').each((i, el) => {
+                const text = $(el).text();
+                const href = $(el).attr('href');
+                if (text.includes(`الحلقة ${targetEpisode}`) || text.includes(`حلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`)) {
+                    entryUrl = href;
+                    return false;
+                }
             });
-
-            for (const item of downloadLinks.slice(0, 2)) {
-                console.log(`[Resolving Stream] ${item.link}`);
-                const directUrl = await resolveDirectAkwamUrl(item.link);
-                console.log(`[Resolved Target] -> ${directUrl}`);
-
-                streams.push({
-                    name: 'Akwam (أكوام)',
-                    title: `1080p | Direct Stream | ${item.label}`,
-                    url: directUrl,
-                    behaviorHints: {
-                        notSupported: false,
-                        proxyHeaders: {
-                            request: {
-                                'User-Agent': HEADERS['User-Agent'],
-                                'Referer': 'https://akwam.ss/'
-                            }
-                        }
-                    }
-                });
-            }
         }
-    } catch (e) {
-        console.error('[Akwam Error]:', e.message);
-    }
-    return streams;
-}
 
-// Scrape and Resolve EgyBest Streams (Updated to egybesstt.bond)
-async function scrapeEgyBest(queryTitle) {
-    const streams = [];
-    const EGYBEST_DOMAIN = 'https://egybesstt.bond';
-    
-    try {
-        const searchUrl = `${EGYBEST_DOMAIN}/auto/search?q=${encodeURIComponent(queryTitle)}`;
-        console.log(`[EgyBest Search] "${queryTitle}" -> ${searchUrl}`);
-        
-        const res = await fetch(searchUrl, { 
-            headers: { 
-                ...HEADERS, 
-                'Referer': `${EGYBEST_DOMAIN}/` 
-            } 
-        });
-        const html = await res.text();
-        const $ = cheerio.load(html);
-
-        const moviePath = $('a.movie, a[href*="/movie/"], a[href*="/series/"], a[href*="/episode/"]').first().attr('href');
-
-        if (moviePath) {
-            const fullUrl = moviePath.startsWith('http') ? moviePath : `${EGYBEST_DOMAIN}${moviePath}`;
-            console.log(`[EgyBest Match] Page found: ${fullUrl}`);
-            const movieRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-            const movieHtml = await movieRes.text();
-            const $movie = cheerio.load(movieHtml);
-
-            const iframeSrc = $movie('iframe.embed_player, iframe[src*="embed"]').attr('src');
-
-            if (iframeSrc) {
-                const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
-                streams.push({
-                    name: 'EgyBest (إيجيبست)',
-                    title: `HD | Native Stream`,
-                    url: streamUrl,
-                    behaviorHints: {
-                        notSupported: false,
-                        proxyHeaders: {
-                            request: {
-                                'User-Agent': HEADERS['User-Agent'],
-                                'Referer': `${EGYBEST_DOMAIN}/`
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    } catch (e) {
-        console.error('[EgyBest Error]:', e.message);
-    }
-    return streams;
-}
-
-app.get('/stream/:type/:id.json', async (req, res) => {
-    const { type, id } = req.params;
-    const cleanId = id.replace('.json', '');
-
-    console.log(`\n========================================`);
-    console.log(`[REQUEST] ${type} ID: ${cleanId}`);
-
-    let season = null;
-    let episode = null;
-    const parts = cleanId.split(':');
-    
-    if (type === 'series' && parts.length >= 3) {
-        season = parts[1];
-        episode = parts[2];
-        console.log(`[Series Targeting] Season ${season}, Episode ${episode}`);
-    }
-
-    const baseTitles = await getMediaTitles(type, cleanId);
-
-    if (baseTitles.length === 0) {
-        return res.json({ streams: [] });
-    }
-
-    const searchQueries = [];
-    for (const title of baseTitles) {
-        if (season && episode) {
-            if (/[\u0600-\u06FF]/.test(title)) {
-                searchQueries.push(`${title} الحلقة ${episode}`);
-                searchQueries.push(`${title} الموسم ${season} الحلقة ${episode}`);
-            }
-            searchQueries.push(`${title} S${season.padStart(2, '0')}E${episode.padStart(2, '0')}`);
-            searchQueries.push(`${title} Episode ${episode}`);
-        }
-        searchQueries.push(title);
-    }
-
-    let allStreams = [];
-
-    for (const query of searchQueries) {
-        const [akwamResults, egybestResults] = await Promise.all([
-            scrapeAkwam(query),
-            scrapeEgyBest(query)
-        ]);
-        
-        allStreams = [...allStreams, ...akwamResults, ...egybestResults];
-        
-        if (allStreams.length > 0) {
-            console.log(`✓ SUCCESS: Direct streams resolved for query: "${query}"`);
-            break;
-        }
-    }
-
-    console.log(`Total resolved streams delivered to Nuvio: ${allStreams.length}`);
-    console.log(`========================================\n`);
-    res.json({ streams: allStreams });
-});
-
-app.listen(PORT, () => {
-    console.log(`\n🚀 Native Resolver active on http://127.0.0.1:${PORT}`);
-});
+        // Fallback to general
