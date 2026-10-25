@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.1.4',
+    version: '1.1.7',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver with strict series path enforcement',
+    description: 'Direct stream resolver with exact structural path matching',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -35,9 +35,7 @@ async function translateToArabic(text) {
             const data = await res.json();
             if (data && data.responseData && data.responseData.translatedText) {
                 const translation = data.responseData.translatedText.trim();
-                if (/[\u0600-\u06FF]/.test(translation)) {
-                    return translation;
-                }
+                if (/[\u0600-\u06FF]/.test(translation)) return translation;
             }
         }
     } catch (e) {}
@@ -118,87 +116,111 @@ async function getMediaTitles(type, rawId) {
     return titleList;
 }
 
-// Akwam Scraper with Force-Series Check
+// Scrape Akwam matching the exact /series/ -> /episode/ -> /watch/ flow
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     try {
-        const searchUrl = `https://akwam.ss/search?q=${encodeURIComponent(queryTitle)}`;
-        const res = await fetch(searchUrl, { headers: HEADERS });
-        const $ = cheerio.load(await res.text());
+        const slugFormatted = queryTitle.replace(/\s+/g, '-');
+        const searchUrls = [
+            `https://akwam.ss/search?q=${encodeURIComponent(queryTitle)}`,
+            `https://akwam.ss/series/${slugFormatted}`
+        ];
 
-        let entryUrl = null;
+        let seriesUrl = null;
 
-        // Force look for series or episode URLs exclusively if mediaType is series
-        $('a').each((i, el) => {
-            const href = $(el).attr('href') || '';
-            const text = $(el).text();
+        for (const url of searchUrls) {
+            const res = await fetch(url, { headers: HEADERS });
+            if (!res.ok) continue;
+            const html = await res.text();
+            const $ = cheerio.load(html);
 
-            if (mediaType === 'series') {
-                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
-                    if (targetEpisode) {
-                        if (text.includes(`الحلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`)) {
-                            entryUrl = href;
-                            return false;
-                        }
-                    } else {
-                        // Take the first verified series landing page if no specific episode matched yet
-                        if (!entryUrl) entryUrl = href;
-                    }
-                }
-            } else {
-                if (href.includes('/movie/')) {
-                    entryUrl = href;
+            if (url.includes('/series/') && !html.includes('404')) {
+                seriesUrl = url;
+                break;
+            }
+
+            $('a[href*="/series/"]').each((i, el) => {
+                const href = $(el).attr('href');
+                if (href && !href.includes('/movie/')) {
+                    seriesUrl = href;
                     return false;
                 }
-            }
-        });
+            });
+            if (seriesUrl) break;
+        }
 
-        if (entryUrl) {
-            let entryRes = await fetch(entryUrl, { headers: HEADERS });
-            let $entry = cheerio.load(await entryRes.text());
+        if (seriesUrl) {
+            console.log(`[Akwam Series Found] ${seriesUrl}`);
+            const seriesRes = await fetch(seriesUrl, { headers: HEADERS });
+            const $series = cheerio.load(await seriesRes.text());
 
-            if (mediaType === 'series' && targetEpisode && entryUrl.includes('/series/')) {
-                let epUrl = null;
-                $entry('a[href*="/episode/"]').each((i, el) => {
-                    const text = $entry(el).text();
-                    const href = $entry(el).attr('href');
-                    if (text.includes(`الحلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`)) {
-                        epUrl = href;
+            let episodeUrl = null;
+            $series('a[href*="/episode/"]').each((i, el) => {
+                const href = $series(el).attr('href');
+                const text = $series(el).text().trim();
+                if (targetEpisode) {
+                    if (text.includes(`الحلقة ${targetEpisode}`) || text.includes(`حلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`) || href.includes(`/${targetEpisode}`)) {
+                        episodeUrl = href;
                         return false;
                     }
-                });
-
-                if (epUrl) {
-                    let epRes = await fetch(epUrl, { headers: HEADERS });
-                    $entry = cheerio.load(await epRes.text());
+                } else {
+                    episodeUrl = href;
+                    return false;
                 }
-            }
-
-            const downloadLinks = [];
-            $entry('a[href*="/download/"], a.link-download, a.btn-primary').each((i, el) => {
-                const link = $entry(el).attr('href');
-                const label = $entry(el).text().trim() || 'Akwam Stream';
-                if (link) downloadLinks.push({ link, label });
             });
 
-            for (const item of downloadLinks.slice(0, 2)) {
-                const directUrl = await resolveDirectAkwamUrl(item.link);
-                streams.push({
-                    name: 'Akwam (أكوام)',
-                    title: `1080p | Series Stream | ${item.label}`,
-                    url: directUrl,
-                    behaviorHints: {
-                        notSupported: false,
-                        proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } }
+            if (episodeUrl) {
+                console.log(`[Akwam Episode Found] ${episodeUrl}`);
+                const epRes = await fetch(episodeUrl, { headers: HEADERS });
+                const $ep = cheerio.load(await epRes.text());
+
+                // Find watch page or direct download links
+                let watchUrl = null;
+                $ep('a[href*="/watch/"]').each((i, el) => {
+                    watchUrl = $ep(el).attr('href');
+                    return false;
+                });
+
+                if (watchUrl) {
+                    console.log(`[Akwam Watch Page] ${watchUrl}`);
+                    const watchRes = await fetch(watchUrl, { headers: HEADERS });
+                    const $watch = cheerio.load(await watchRes.text());
+                    
+                    $watch('a[href*=".mp4"], a.download-link, a[href*="dl."]').each((i, el) => {
+                        const link = $watch(el).attr('href');
+                        if (link) {
+                            streams.push({
+                                name: 'Akwam (أكوام)',
+                                title: `1080p | Direct Stream`,
+                                url: link,
+                                behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } } }
+                            });
+                        }
+                    });
+                }
+
+                // Fallback to standard download links on episode page
+                $ep('a[href*="/download/"], a.link-download, a.btn-primary').each((i, el) => {
+                    const link = $ep(el).attr('href');
+                    const label = $ep(el).text().trim() || 'Akwam Stream';
+                    if (link && streams.length === 0) {
+                        streams.push({
+                            name: 'Akwam (أكوام)',
+                            title: `1080p | ${label}`,
+                            url: link,
+                            behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } } }
+                        });
                     }
                 });
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[Akwam Error]:', e.message);
+    }
     return streams;
 }
 
-// EgyBest Scraper with Force-Series Check
+// Scrape EgyBest matching watch.php?vid= pattern
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
@@ -208,54 +230,32 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
         const res = await fetch(searchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
         const $ = cheerio.load(await res.text());
 
-        let moviePath = null;
-
+        let episodePath = null;
         $('a').each((i, el) => {
             const href = $(el).attr('href') || '';
-            const text = $(el).text();
+            const text = $(el).text().trim();
 
             if (mediaType === 'series') {
-                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
+                if (href.includes('/episode/') || href.includes('watch.php')) {
                     if (targetEpisode) {
                         if (text.includes(`حلقة ${targetEpisode}`) || href.includes(`ep-${targetEpisode}`)) {
-                            moviePath = href;
+                            episodePath = href;
                             return false;
                         }
-                    } else {
-                        if (!moviePath) moviePath = href;
+                    } else if (!episodePath) {
+                        episodePath = href;
                     }
-                }
-            } else {
-                if (href.includes('/movie/')) {
-                    moviePath = href;
-                    return false;
                 }
             }
         });
 
-        if (moviePath) {
-            const fullUrl = moviePath.startsWith('http') ? moviePath : `${EGYBEST_DOMAIN}${moviePath}`;
-            let movieRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-            let $movie = cheerio.load(await movieRes.text());
+        if (episodePath) {
+            const fullUrl = episodePath.startsWith('http') ? episodePath : `${EGYBEST_DOMAIN}${episodePath}`;
+            console.log(`[EgyBest Match] ${fullUrl}`);
+            const epRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
+            const $ep = cheerio.load(await epRes.text());
 
-            if (mediaType === 'series' && targetEpisode && fullUrl.includes('/series/')) {
-                let epPath = null;
-                $movie('a[href*="/episode/"]').each((i, el) => {
-                    const href = $movie(el).attr('href');
-                    if (href.includes(`ep-${targetEpisode}`) || $movie(el).text().includes(`${targetEpisode}`)) {
-                        epPath = href;
-                        return false;
-                    }
-                });
-
-                if (epPath) {
-                    const epUrl = epPath.startsWith('http') ? epPath : `${EGYBEST_DOMAIN}${epPath}`;
-                    let epRes = await fetch(epUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-                    $movie = cheerio.load(await epRes.text());
-                }
-            }
-
-            const iframeSrc = $movie('iframe.embed_player, iframe[src*="embed"]').attr('src');
+            const iframeSrc = $ep('iframe.embed_player, iframe[src*="embed"]').attr('src');
             if (iframeSrc) {
                 const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
                 streams.push({
@@ -292,9 +292,8 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     for (const title of baseTitles) {
         if (season && episode) {
             if (/[\u0600-\u06FF]/.test(title)) {
-                searchQueries.push(`${title} الحلقة ${episode}`);
+                searchQueries.push(`${title}`);
             }
-            searchQueries.push(`${title} S${season.padStart(2, '0')}E${episode.padStart(2, '0')}`);
         }
         searchQueries.push(title);
     }
