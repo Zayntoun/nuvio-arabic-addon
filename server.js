@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.1.3',
+    version: '1.1.4',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver with anti-movie blocking for TV series',
+    description: 'Direct stream resolver with strict series path enforcement',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -40,9 +40,7 @@ async function translateToArabic(text) {
                 }
             }
         }
-    } catch (e) {
-        console.warn('[Translate Error]:', e.message);
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -120,7 +118,7 @@ async function getMediaTitles(type, rawId) {
     return titleList;
 }
 
-// Akwam Scraper with Anti-Movie Guardrails
+// Akwam Scraper with Force-Series Check
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     try {
@@ -130,22 +128,21 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
 
         let entryUrl = null;
 
-        // Iterate through all potential links and aggressively weed out movies if it's a series request
+        // Force look for series or episode URLs exclusively if mediaType is series
         $('a').each((i, el) => {
             const href = $(el).attr('href') || '';
             const text = $(el).text();
 
             if (mediaType === 'series') {
-                // Must be series/episode and CANNOT contain movie indicators
-                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/') && !text.includes('فيلم')) {
+                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
                     if (targetEpisode) {
                         if (text.includes(`الحلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`)) {
                             entryUrl = href;
                             return false;
                         }
                     } else {
-                        entryUrl = href;
-                        return false;
+                        // Take the first verified series landing page if no specific episode matched yet
+                        if (!entryUrl) entryUrl = href;
                     }
                 }
             } else {
@@ -201,7 +198,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     return streams;
 }
 
-// EgyBest Scraper with Anti-Movie Guardrails
+// EgyBest Scraper with Force-Series Check
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
@@ -218,15 +215,14 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
             const text = $(el).text();
 
             if (mediaType === 'series') {
-                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/') && !text.includes('فيلم')) {
+                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
                     if (targetEpisode) {
                         if (text.includes(`حلقة ${targetEpisode}`) || href.includes(`ep-${targetEpisode}`)) {
                             moviePath = href;
                             return false;
                         }
                     } else {
-                        moviePath = href;
-                        return false;
+                        if (!moviePath) moviePath = href;
                     }
                 }
             } else {
