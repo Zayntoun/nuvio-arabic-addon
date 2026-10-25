@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.1.7',
+    version: '1.1.8',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver with exact structural path matching',
+    description: 'Direct stream resolver optimized for episode page link extraction',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -60,7 +60,7 @@ async function resolveDirectAkwamUrl(linkUrl) {
 
         const html = await res.text();
         const $ = cheerio.load(html);
-        const directMp4 = $('a[href*=".mp4"], a.download-link, a[href*="dl."]').first().attr('href');
+        const directMp4 = $('a[href*=".mp4"], a.download-link, a[href*="dl."], a[data-url*=".mp4"]').first().attr('href');
         return directMp4 || finalUrl;
     } catch (e) {
         return linkUrl;
@@ -116,7 +116,7 @@ async function getMediaTitles(type, rawId) {
     return titleList;
 }
 
-// Scrape Akwam matching the exact /series/ -> /episode/ -> /watch/ flow
+// Akwam Scraper optimized to grab links instantly from the episode page
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     try {
@@ -174,41 +174,19 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
                 const epRes = await fetch(episodeUrl, { headers: HEADERS });
                 const $ep = cheerio.load(await epRes.text());
 
-                // Find watch page or direct download links
-                let watchUrl = null;
-                $ep('a[href*="/watch/"]').each((i, el) => {
-                    watchUrl = $ep(el).attr('href');
-                    return false;
-                });
-
-                if (watchUrl) {
-                    console.log(`[Akwam Watch Page] ${watchUrl}`);
-                    const watchRes = await fetch(watchUrl, { headers: HEADERS });
-                    const $watch = cheerio.load(await watchRes.text());
-                    
-                    $watch('a[href*=".mp4"], a.download-link, a[href*="dl."]').each((i, el) => {
-                        const link = $watch(el).attr('href');
-                        if (link) {
-                            streams.push({
-                                name: 'Akwam (أكوام)',
-                                title: `1080p | Direct Stream`,
-                                url: link,
-                                behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } } }
-                            });
-                        }
-                    });
-                }
-
-                // Fallback to standard download links on episode page
-                $ep('a[href*="/download/"], a.link-download, a.btn-primary').each((i, el) => {
+                // Grab all direct download / streaming quality links on the episode page
+                $ep('a[href*="/download/"], a.link-download, a.btn-primary, a[href*="dl."]').each((i, el) => {
                     const link = $ep(el).attr('href');
-                    const label = $ep(el).text().trim() || 'Akwam Stream';
-                    if (link && streams.length === 0) {
+                    const label = $ep(el).text().trim() || 'Akwam HD Stream';
+                    if (link) {
                         streams.push({
                             name: 'Akwam (أكوام)',
                             title: `1080p | ${label}`,
                             url: link,
-                            behaviorHints: { notSupported: false, proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } } }
+                            behaviorHints: { 
+                                notSupported: false, 
+                                proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } } 
+                            }
                         });
                     }
                 });
@@ -220,7 +198,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     return streams;
 }
 
-// Scrape EgyBest matching watch.php?vid= pattern
+// Scrape EgyBest
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
@@ -251,7 +229,6 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
 
         if (episodePath) {
             const fullUrl = episodePath.startsWith('http') ? episodePath : `${EGYBEST_DOMAIN}${episodePath}`;
-            console.log(`[EgyBest Match] ${fullUrl}`);
             const epRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
             const $ep = cheerio.load(await epRes.text());
 
