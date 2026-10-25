@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.1.9',
+    version: '1.3.0',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver with strict title matching and watch page resolution',
+    description: 'Dynamic stream resolver for movies and TV series',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -26,6 +26,7 @@ const MANIFEST = {
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
+// Helper: Translate English title to Arabic text
 async function translateToArabic(text) {
     if (!text) return null;
     try {
@@ -35,10 +36,15 @@ async function translateToArabic(text) {
             const data = await res.json();
             if (data && data.responseData && data.responseData.translatedText) {
                 const translation = data.responseData.translatedText.trim();
-                if (/[\u0600-\u06FF]/.test(translation)) return translation;
+                if (/[\u0600-\u06FF]/.test(translation)) {
+                    console.log(`[Translate Success] "${text}" -> "${translation}"`);
+                    return translation;
+                }
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.warn('[Translate Error]:', e.message);
+    }
     return null;
 }
 
@@ -52,7 +58,7 @@ function cleanTitle(str) {
         .trim();
 }
 
-// Resolve the final watch page to extract direct playable source
+// Extract direct raw video URL by resolving watch page script tags
 async function resolveAkwamWatchPage(watchUrl) {
     try {
         console.log(`[Resolving Watch Page] ${watchUrl}`);
@@ -60,12 +66,18 @@ async function resolveAkwamWatchPage(watchUrl) {
         const html = await res.text();
         const $ = cheerio.load(html);
 
-        // Look for direct mp4 links or video sources embedded in the watch page
-        let directUrl = $('a[href*=".mp4"], a.download-link, a[href*="dl."]').first().attr('href');
+        let directUrl = $('a[href*=".mp4"], a[href*=".m3u8"], a.download-link, a[href*="dl."]').first().attr('href');
+        
         if (!directUrl) {
-            // Check script tags or iframe sources inside the player
-            const iframe = $('iframe').attr('src');
-            if (iframe) directUrl = iframe;
+            const scripts = $('script').toArray();
+            for (const script of scripts) {
+                const content = $(script).html() || '';
+                const match = content.match(/https?:\/\/[^"']+\.(mp4|m3u8)[^"']*/i);
+                if (match) {
+                    directUrl = match[0];
+                    break;
+                }
+            }
         }
         return directUrl || watchUrl;
     } catch (e) {
@@ -73,34 +85,37 @@ async function resolveAkwamWatchPage(watchUrl) {
     }
 }
 
+// Fetch Title metadata prioritizing Arabic script
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     let baseTitle = null;
     const cleanImdbId = rawId.split(':')[0];
 
+    // Method 1: TMDB Find API for direct Arabic title
     try {
-        const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
-        const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
-        if (res.ok) {
-            const data = await res.json();
-            if (data && data.meta && data.meta.name) baseTitle = data.meta.name;
+        const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
+        const tmdbRes = await fetch(tmdbUrl);
+        if (tmdbRes.ok) {
+            const data = await tmdbRes.json();
+            const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
+            if (result) {
+                if (result.title || result.name) {
+                    const t = result.title || result.name;
+                    if (/[\u0600-\u06FF]/.test(t)) titles.add(t);
+                }
+                baseTitle = result.original_title || result.original_name;
+            }
         }
     } catch (err) {}
 
+    // Method 2: Cinemeta Official Stremio API
     if (!baseTitle) {
         try {
-            const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
-            const tmdbRes = await fetch(tmdbUrl);
-            if (tmdbRes.ok) {
-                const data = await tmdbRes.json();
-                const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
-                if (result) {
-                    if (result.title || result.name) {
-                        const t = result.title || result.name;
-                        if (/[\u0600-\u06FF]/.test(t)) titles.add(t);
-                    }
-                    baseTitle = result.original_title || result.original_name;
-                }
+            const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
+            const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.meta && data.meta.name) baseTitle = data.meta.name;
             }
         } catch (err) {}
     }
@@ -118,17 +133,18 @@ async function getMediaTitles(type, rawId) {
     }
 
     const titleList = Array.from(titles).filter(Boolean);
-    // Prioritize Arabic titles strictly
+    // Put Arabic script titles strictly at the front of the queue
     titleList.sort((a, b) => (/[\u0600-\u06FF]/.test(a) ? -1 : 1));
+    console.log(`[Search Base Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
 }
 
-// Scrape Akwam with Strict Title Validation & Watch Page Resolution
+// Dynamic Akwam Scraper with strict result title validation
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     try {
         const searchUrl = `https://akwam.ss/search?q=${encodeURIComponent(queryTitle)}`;
-        console.log(`[Akwam Search] "${queryTitle}"`);
+        console.log(`[Akwam Searching] "${queryTitle}"`);
         const res = await fetch(searchUrl, { headers: HEADERS });
         if (!res.ok) return streams;
 
@@ -137,42 +153,55 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
 
         let seriesUrl = null;
 
-        // Ensure the found series title actually matches the search query or contains relevant terms
-        $('a[href*="/series/"]').each((i, el) => {
-            const href = $(el).attr('href');
+        $('a').each((i, el) => {
+            const href = $(el).attr('href') || '';
             const text = $(el).text().trim();
-            if (href && !href.includes('/movie/')) {
-                seriesUrl = href;
-                return false; // Take first valid series
+
+            if (mediaType === 'series') {
+                if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
+                    // Title check: Ensure result text shares words with query to prevent wrong show matches
+                    const isRelevant = queryTitle.split(' ').some(word => word.length > 2 && text.includes(word));
+                    if (isRelevant || !seriesUrl) {
+                        seriesUrl = href;
+                        if (isRelevant) return false;
+                    }
+                }
+            } else {
+                if (href.includes('/movie/')) {
+                    seriesUrl = href;
+                    return false;
+                }
             }
         });
 
         if (seriesUrl) {
-            console.log(`[Akwam Series Found] ${seriesUrl}`);
+            console.log(`[Akwam Validated Series Page] ${seriesUrl}`);
             const seriesRes = await fetch(seriesUrl, { headers: HEADERS });
             const $series = cheerio.load(await seriesRes.text());
 
             let episodeUrl = null;
-            $series('a[href*="/episode/"]').each((i, el) => {
-                const href = $series(el).attr('href');
-                const text = $series(el).text().trim();
-                if (targetEpisode) {
-                    if (text.includes(`الحلقة ${targetEpisode}`) || text.includes(`حلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`) || href.includes(`/${targetEpisode}`)) {
+            if (mediaType === 'series') {
+                $series('a[href*="/episode/"]').each((i, el) => {
+                    const href = $series(el).attr('href');
+                    const text = $series(el).text().trim();
+                    if (targetEpisode) {
+                        if (text.includes(`الحلقة ${targetEpisode}`) || text.includes(`حلقة ${targetEpisode}`) || href.includes(`-episode-${targetEpisode}`) || href.endsWith(`/${targetEpisode}`)) {
+                            episodeUrl = href;
+                            return false;
+                        }
+                    } else if (!episodeUrl) {
                         episodeUrl = href;
-                        return false;
                     }
-                } else {
-                    episodeUrl = href;
-                    return false;
-                }
-            });
+                });
+            } else {
+                episodeUrl = seriesUrl; // For movies
+            }
 
             if (episodeUrl) {
-                console.log(`[Akwam Episode Found] ${episodeUrl}`);
+                console.log(`[Akwam Episode Page] ${episodeUrl}`);
                 const epRes = await fetch(episodeUrl, { headers: HEADERS });
                 const $ep = cheerio.load(await epRes.text());
 
-                // Find the watch page link (`/watch/...`)
                 let watchUrl = null;
                 $ep('a[href*="/watch/"]').each((i, el) => {
                     watchUrl = $ep(el).attr('href');
@@ -180,13 +209,11 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
                 });
 
                 if (watchUrl) {
-                    console.log(`[Akwam Watch Page] ${watchUrl}`);
                     const finalPlayableUrl = await resolveAkwamWatchPage(watchUrl);
-                    console.log(`[Final Playable Stream] ${finalPlayableUrl}`);
-
+                    console.log(`[Akwam Stream Resolved] ${finalPlayableUrl}`);
                     streams.push({
                         name: 'Akwam (أكوام)',
-                        title: `1080p | Native Stream`,
+                        title: `1080p | Dynamic Stream`,
                         url: finalPlayableUrl,
                         behaviorHints: {
                             notSupported: false,
@@ -202,7 +229,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     return streams;
 }
 
-// Scrape EgyBest
+// Dynamic EgyBest Scraper
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
@@ -212,27 +239,33 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
         const res = await fetch(searchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
         const $ = cheerio.load(await res.text());
 
-        let episodePath = null;
+        let moviePath = null;
+
         $('a').each((i, el) => {
             const href = $(el).attr('href') || '';
             const text = $(el).text().trim();
 
             if (mediaType === 'series') {
-                if (href.includes('/episode/') || href.includes('watch.php')) {
+                if (href.includes('/series/') || href.includes('/episode/')) {
                     if (targetEpisode) {
                         if (text.includes(`حلقة ${targetEpisode}`) || href.includes(`ep-${targetEpisode}`)) {
-                            episodePath = href;
+                            moviePath = href;
                             return false;
                         }
-                    } else if (!episodePath) {
-                        episodePath = href;
+                    } else if (!moviePath) {
+                        moviePath = href;
                     }
+                }
+            } else {
+                if (href.includes('/movie/')) {
+                    moviePath = href;
+                    return false;
                 }
             }
         });
 
-        if (episodePath) {
-            const fullUrl = episodePath.startsWith('http') ? episodePath : `${EGYBEST_DOMAIN}${episodePath}`;
+        if (moviePath) {
+            const fullUrl = moviePath.startsWith('http') ? moviePath : `${EGYBEST_DOMAIN}${moviePath}`;
             const epRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
             const $ep = cheerio.load(await epRes.text());
 
@@ -241,7 +274,7 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
                 const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
                 streams.push({
                     name: 'EgyBest (إيجيبست)',
-                    title: `HD | Series Stream`,
+                    title: `HD | Dynamic Stream`,
                     url: streamUrl,
                     behaviorHints: {
                         notSupported: false,
@@ -258,29 +291,41 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     const { type, id } = req.params;
     const cleanId = id.replace('.json', '');
 
+    console.log(`\n========================================`);
+    console.log(`[REQUEST] ${type} ID: ${cleanId}`);
+
     let season = null;
     let episode = null;
     const parts = cleanId.split(':');
     if (type === 'series' && parts.length >= 3) {
         season = parts[1];
         episode = parts[2];
+        console.log(`[Series Request] Season ${season}, Episode ${episode}`);
     }
 
     const baseTitles = await getMediaTitles(type, cleanId);
     if (baseTitles.length === 0) return res.json({ streams: [] });
 
-    // Use only the primary Arabic title or first search query to prevent mismatched searches
-    const query = baseTitles[0];
-
     let allStreams = [];
-    const [akwamResults, egybestResults] = await Promise.all([
-        scrapeAkwam(query, episode, type),
-        scrapeEgyBest(query, episode, type)
-    ]);
-    
-    allStreams = [...allStreams, ...akwamResults, ...egybestResults];
 
+    for (const title of baseTitles) {
+        const [akwamResults, egybestResults] = await Promise.all([
+            scrapeAkwam(title, episode, type),
+            scrapeEgyBest(title, episode, type)
+        ]);
+        
+        allStreams = [...allStreams, ...akwamResults, ...egybestResults];
+        if (allStreams.length > 0) {
+            console.log(`✓ Streams found using title query: "${title}"`);
+            break;
+        }
+    }
+
+    console.log(`Total streams delivered: ${allStreams.length}`);
+    console.log(`========================================\n`);
     res.json({ streams: allStreams });
 });
 
-app.listen(PORT, () => {});
+app.listen(PORT, () => {
+    console.log(`\n🚀 Dynamic Resolver active on http://127.0.0.1:${PORT}`);
+});
