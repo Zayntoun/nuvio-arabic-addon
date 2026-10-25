@@ -16,34 +16,15 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.6.0',
+    version: '1.7.0',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Direct stream resolver with Arabic dictionary mapping and fixed player embed resolution',
+    description: 'Fully dynamic Arabic media resolver using native TMDB Arabic metadata',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
 };
 
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
-
-// Helper: Translate text to Arabic
-async function translateToArabic(text) {
-    if (!text) return null;
-    try {
-        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
-        const res = await fetch(url);
-        if (res.ok) {
-            const data = await res.json();
-            if (data && data.responseData && data.responseData.translatedText) {
-                const translation = data.responseData.translatedText.trim();
-                if (/[\u0600-\u06FF]/.test(translation)) {
-                    return translation;
-                }
-            }
-        }
-    } catch (e) {}
-    return null;
-}
 
 // Resolve Akwam Watch page video source
 async function resolveAkwamWatchPage(watchUrl) {
@@ -70,64 +51,62 @@ async function resolveAkwamWatchPage(watchUrl) {
     }
 }
 
-// Get Media Titles with robust Arabic fallback mapping
+// 100% Dynamic Metadata Fetcher using TMDB Native Arabic Lookup
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
-    let baseTitle = null;
     const cleanImdbId = rawId.split(':')[0];
+    const tmdbMediaType = type === 'series' ? 'tv' : 'movie';
 
-    // Manual Arabic Dictionary Mapping for precision matching on recent Arabic releases
-    const ARABIC_DICTIONARY = {
-        'tt48434821': 'طالع نازل',
-        'tt40260395': 'حكاية نرجس'
-    };
-
-    if (ARABIC_DICTIONARY[cleanImdbId]) {
-        titles.add(ARABIC_DICTIONARY[cleanImdbId]);
-    }
-
-    // Method 1: TMDB Arabic Find
     try {
+        // Query TMDB directly with language set to Arabic (ar-EG) using IMDb ID
         const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
-        const tmdbRes = await fetch(tmdbUrl);
-        if (tmdbRes.ok) {
-            const data = await tmdbRes.json();
-            const result = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
-            if (result) {
-                if (result.title || result.name) {
-                    const t = result.title || result.name;
-                    if (/[\u0600-\u06FF]/.test(t)) titles.add(t);
+        console.log(`[TMDB Lookup] Fetching Arabic metadata for ${cleanImdbId}`);
+        
+        const res = await fetch(tmdbUrl);
+        if (res.ok) {
+            const data = await res.json();
+            const results = type === 'series' ? data.tv_results : data.movie_results;
+            
+            if (results && results.length > 0) {
+                const item = results[0];
+                const arabicTitle = item.title || item.name;
+                const originalTitle = item.original_title || item.original_name;
+
+                if (arabicTitle && /[\u0600-\u06FF]/.test(arabicTitle)) {
+                    titles.add(arabicTitle);
+                    console.log(`[TMDB Native Arabic Title Found]: ${arabicTitle}`);
                 }
-                baseTitle = result.original_title || result.original_name;
+                if (originalTitle) {
+                    titles.add(originalTitle);
+                }
             }
         }
-    } catch (err) {}
+    } catch (e) {
+        console.warn('[TMDB Lookup Error]:', e.message);
+    }
 
-    // Method 2: Cinemeta
-    if (!baseTitle) {
+    // Fallback to Cinemeta if TMDB didn't yield an Arabic result
+    if (titles.size === 0) {
         try {
             const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
-            const res = await fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } });
+            const res = await fetch(url);
             if (res.ok) {
                 const data = await res.json();
-                if (data && data.meta && data.meta.name) baseTitle = data.meta.name;
+                if (data && data.meta && data.meta.name) {
+                    titles.add(data.meta.name);
+                }
             }
         } catch (err) {}
     }
 
-    if (baseTitle && !titles.has(baseTitle)) {
-        const ar = await translateToArabic(baseTitle);
-        if (ar) titles.add(ar);
-        titles.add(baseTitle);
-    }
-
     const titleList = Array.from(titles).filter(Boolean);
+    // Prioritize Arabic script strictly
     titleList.sort((a, b) => (/[\u0600-\u06FF]/.test(a) ? -1 : 1));
-    console.log(`[Final Search Queue for ${cleanImdbId}]:`, titleList);
+    console.log(`[Dynamic Search Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
 }
 
-// Akwam Scraper with strict keyword validation
+// Akwam Scraper
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     try {
@@ -145,13 +124,13 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
 
             if (mediaType === 'series') {
                 if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
-                    // Verify that the found result contains key terms from our query to avoid wrong show matches
-                    const queryWords = queryTitle.split(' ');
-                    const matches = queryWords.every(word => word.length <= 2 || text.includes(word));
-                    if (matches || !seriesUrl) {
-                        seriesUrl = href;
-                        if (matches) return false;
-                    }
+                    seriesUrl = href;
+                    return false;
+                }
+            } else {
+                if (href.includes('/movie/')) {
+                    seriesUrl = href;
+                    return false;
                 }
             }
         });
@@ -205,7 +184,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     return streams;
 }
 
-// EgyBest Scraper with embedded iframe player extraction
+// EgyBest Scraper
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
@@ -240,7 +219,6 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
             const watchRes = await fetch(fullWatchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
             const $watch = cheerio.load(await watchRes.text());
 
-            // Extract iframe embed player source from the watch/play page
             const iframeSrc = $watch('iframe.embed_player, iframe[src*="embed"], iframe[src*="play"]').attr('src');
             if (iframeSrc) {
                 const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
@@ -295,5 +273,5 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 Stable Arabic Resolver active on http://127.0.0.1:${PORT}`);
+    console.log(`\n🚀 Fully Dynamic Arabic Resolver active on http://127.0.0.1:${PORT}`);
 });
