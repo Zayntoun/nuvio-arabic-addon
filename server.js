@@ -16,9 +16,9 @@ const HEADERS = {
 
 const MANIFEST = {
     id: 'org.arabic.akwam.egybest',
-    version: '1.3.0',
+    version: '1.4.0',
     name: 'Akwam & EgyBest Scraper',
-    description: 'Dynamic stream resolver for movies and TV series',
+    description: 'Dynamic Arabic-first stream resolver',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -42,9 +42,7 @@ async function translateToArabic(text) {
                 }
             }
         }
-    } catch (e) {
-        console.warn('[Translate Error]:', e.message);
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -58,10 +56,9 @@ function cleanTitle(str) {
         .trim();
 }
 
-// Extract direct raw video URL by resolving watch page script tags
+// Resolve Akwam Watch page to extract clean direct video link
 async function resolveAkwamWatchPage(watchUrl) {
     try {
-        console.log(`[Resolving Watch Page] ${watchUrl}`);
         const res = await fetch(watchUrl, { headers: HEADERS, redirect: 'follow' });
         const html = await res.text();
         const $ = cheerio.load(html);
@@ -79,19 +76,19 @@ async function resolveAkwamWatchPage(watchUrl) {
                 }
             }
         }
-        return directUrl || watchUrl;
+        return directUrl ? directUrl.replace(/^vcl:\/\//, '').replace(/^vlc:\/\//, '') : null;
     } catch (e) {
-        return watchUrl;
+        return null;
     }
 }
 
-// Fetch Title metadata prioritizing Arabic script
+// Fetch Title metadata forcing Arabic text
 async function getMediaTitles(type, rawId) {
     const titles = new Set();
     let baseTitle = null;
     const cleanImdbId = rawId.split(':')[0];
 
-    // Method 1: TMDB Find API for direct Arabic title
+    // Method 1: TMDB Find API for Arabic title
     try {
         const tmdbUrl = `https://api.themoviedb.org/3/find/${cleanImdbId}?api_key=15d2ea6d0dc1d476efbca3eba2b9bbf3&external_source=imdb_id&language=ar-EG`;
         const tmdbRes = await fetch(tmdbUrl);
@@ -108,7 +105,7 @@ async function getMediaTitles(type, rawId) {
         }
     } catch (err) {}
 
-    // Method 2: Cinemeta Official Stremio API
+    // Method 2: Cinemeta API
     if (!baseTitle) {
         try {
             const url = `https://v3-cinemeta.strem.io/meta/${type}/${cleanImdbId}.json`;
@@ -122,29 +119,31 @@ async function getMediaTitles(type, rawId) {
 
     if (baseTitle) {
         const cleanedEnglish = cleanTitle(baseTitle);
-        if (cleanedEnglish) titles.add(cleanedEnglish);
-        titles.add(baseTitle);
-
-        const hasArabic = Array.from(titles).some(t => /[\u0600-\u06FF]/.test(t));
-        if (!hasArabic) {
-            const ar = await translateToArabic(cleanedEnglish || baseTitle);
-            if (ar) titles.add(ar);
+        // Force translation to Arabic if title is in English characters
+        const arabicTranslation = await translateToArabic(cleanedEnglish || baseTitle);
+        if (arabicTranslation) {
+            titles.add(arabicTranslation);
+            const cleanedArabic = cleanTitle(arabicTranslation);
+            if (cleanedArabic) titles.add(cleanedArabic);
         }
+        titles.add(baseTitle);
     }
 
     const titleList = Array.from(titles).filter(Boolean);
-    // Put Arabic script titles strictly at the front of the queue
+    // Strict priority for Arabic script items
     titleList.sort((a, b) => (/[\u0600-\u06FF]/.test(a) ? -1 : 1));
-    console.log(`[Search Base Queue for ${cleanImdbId}]:`, titleList);
+    console.log(`[Arabic Search Queue for ${cleanImdbId}]:`, titleList);
     return titleList;
 }
 
-// Dynamic Akwam Scraper with strict result title validation
+// Akwam Scraper with strict matching
 async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     const streams = [];
+    if (!/[\u0600-\u06FF]/.test(queryTitle)) return streams; // Ignore non-Arabic queries
+
     try {
         const searchUrl = `https://akwam.ss/search?q=${encodeURIComponent(queryTitle)}`;
-        console.log(`[Akwam Searching] "${queryTitle}"`);
+        console.log(`[Akwam Arabic Search] "${queryTitle}"`);
         const res = await fetch(searchUrl, { headers: HEADERS });
         if (!res.ok) return streams;
 
@@ -159,11 +158,11 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
 
             if (mediaType === 'series') {
                 if ((href.includes('/series/') || href.includes('/episode/')) && !href.includes('/movie/')) {
-                    // Title check: Ensure result text shares words with query to prevent wrong show matches
-                    const isRelevant = queryTitle.split(' ').some(word => word.length > 2 && text.includes(word));
-                    if (isRelevant || !seriesUrl) {
+                    // Match query keywords
+                    const isMatch = queryTitle.split(' ').some(word => word.length > 1 && text.includes(word));
+                    if (isMatch || !seriesUrl) {
                         seriesUrl = href;
-                        if (isRelevant) return false;
+                        if (isMatch) return false;
                     }
                 }
             } else {
@@ -175,7 +174,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
         });
 
         if (seriesUrl) {
-            console.log(`[Akwam Validated Series Page] ${seriesUrl}`);
+            console.log(`[Akwam Match Found] ${seriesUrl}`);
             const seriesRes = await fetch(seriesUrl, { headers: HEADERS });
             const $series = cheerio.load(await seriesRes.text());
 
@@ -194,7 +193,7 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
                     }
                 });
             } else {
-                episodeUrl = seriesUrl; // For movies
+                episodeUrl = seriesUrl;
             }
 
             if (episodeUrl) {
@@ -210,16 +209,18 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
 
                 if (watchUrl) {
                     const finalPlayableUrl = await resolveAkwamWatchPage(watchUrl);
-                    console.log(`[Akwam Stream Resolved] ${finalPlayableUrl}`);
-                    streams.push({
-                        name: 'Akwam (أكوام)',
-                        title: `1080p | Dynamic Stream`,
-                        url: finalPlayableUrl,
-                        behaviorHints: {
-                            notSupported: false,
-                            proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } }
-                        }
-                    });
+                    if (finalPlayableUrl) {
+                        console.log(`[Akwam Stream Success] ${finalPlayableUrl}`);
+                        streams.push({
+                            name: 'Akwam (أكوام)',
+                            title: `1080p | Native Stream`,
+                            url: finalPlayableUrl,
+                            behaviorHints: {
+                                notSupported: false,
+                                proxyHeaders: { request: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://akwam.ss/' } }
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -229,43 +230,40 @@ async function scrapeAkwam(queryTitle, targetEpisode, mediaType) {
     return streams;
 }
 
-// Dynamic EgyBest Scraper
+// EgyBest Scraper with Arabic search
 async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
     const streams = [];
+    if (!/[\u0600-\u06FF]/.test(queryTitle)) return streams;
+
     const EGYBEST_DOMAIN = 'https://egybesstt.bond';
-    
     try {
         const searchUrl = `${EGYBEST_DOMAIN}/auto/search?q=${encodeURIComponent(queryTitle)}`;
+        console.log(`[EgyBest Arabic Search] "${queryTitle}"`);
         const res = await fetch(searchUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
-        const $ = cheerio.load(await res.text());
+        if (!res.ok) return streams;
 
-        let moviePath = null;
+        const html = await res.text();
+        const $ = cheerio.load(html);
 
+        let episodePath = null;
         $('a').each((i, el) => {
             const href = $(el).attr('href') || '';
             const text = $(el).text().trim();
 
             if (mediaType === 'series') {
-                if (href.includes('/series/') || href.includes('/episode/')) {
-                    if (targetEpisode) {
-                        if (text.includes(`حلقة ${targetEpisode}`) || href.includes(`ep-${targetEpisode}`)) {
-                            moviePath = href;
-                            return false;
-                        }
-                    } else if (!moviePath) {
-                        moviePath = href;
+                if (href.includes('/series/') || href.includes('/episode/') || href.includes('watch.php')) {
+                    const isMatch = queryTitle.split(' ').some(word => word.length > 1 && text.includes(word));
+                    if (isMatch || !episodePath) {
+                        episodePath = href;
+                        if (isMatch) return false;
                     }
-                }
-            } else {
-                if (href.includes('/movie/')) {
-                    moviePath = href;
-                    return false;
                 }
             }
         });
 
-        if (moviePath) {
-            const fullUrl = moviePath.startsWith('http') ? moviePath : `${EGYBEST_DOMAIN}${moviePath}`;
+        if (episodePath) {
+            const fullUrl = episodePath.startsWith('http') ? episodePath : `${EGYBEST_DOMAIN}${episodePath}`;
+            console.log(`[EgyBest Match] ${fullUrl}`);
             const epRes = await fetch(fullUrl, { headers: { ...HEADERS, 'Referer': `${EGYBEST_DOMAIN}/` } });
             const $ep = cheerio.load(await epRes.text());
 
@@ -274,7 +272,7 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
                 const streamUrl = iframeSrc.startsWith('//') ? `https:${iframeSrc}` : iframeSrc;
                 streams.push({
                     name: 'EgyBest (إيجيبست)',
-                    title: `HD | Dynamic Stream`,
+                    title: `HD | Native Stream`,
                     url: streamUrl,
                     behaviorHints: {
                         notSupported: false,
@@ -283,7 +281,9 @@ async function scrapeEgyBest(queryTitle, targetEpisode, mediaType) {
                 });
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[EgyBest Error]:', e.message);
+    }
     return streams;
 }
 
@@ -316,7 +316,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         
         allStreams = [...allStreams, ...akwamResults, ...egybestResults];
         if (allStreams.length > 0) {
-            console.log(`✓ Streams found using title query: "${title}"`);
+            console.log(`✓ Streams found using Arabic query: "${title}"`);
             break;
         }
     }
@@ -327,5 +327,5 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 Dynamic Resolver active on http://127.0.0.1:${PORT}`);
+    console.log(`\n🚀 Arabic Resolver active on http://127.0.0.1:${PORT}`);
 });
